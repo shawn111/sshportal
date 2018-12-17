@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"runtime"
 	"strings"
@@ -835,6 +836,39 @@ GLOBAL OPTIONS:
 							})
 						}
 						table.Render()
+						return nil
+					},
+				}, {
+					Name:      "healthcheck",
+					Usage:     "Check tcp connection of hosts",
+					ArgsUsage: "HOST...",
+					Action: func(c *cli.Context) error {
+						if c.NArg() < 1 {
+							return cli.ShowSubcommandHelp(c)
+						}
+
+						if err := myself.CheckRoles([]string{"admin"}); err != nil {
+							return err
+						}
+
+						var hosts []Host
+						if err := HostsByIdentifiers(db, c.Args()).Find(&hosts).Error; err != nil {
+							return err
+						}
+
+						if len(hosts) > 1 && c.String("name") != "" {
+							return fmt.Errorf("cannot set --name when editing multiple hosts at once")
+						}
+
+						for _, host := range hosts {
+							dest := host.DialAddr()
+							hostHealthcheck := "ok"
+							if _, err := net.DialTimeout("tcp", dest, 0); err != nil {
+								fmt.Fprintf(s, "%v\n", err)
+								hostHealthcheck = "bad"
+							}
+							fmt.Fprintf(s, "%s: %s %s\n", host.Name, dest, hostHealthcheck)
+						}
 						return nil
 					},
 				}, {
