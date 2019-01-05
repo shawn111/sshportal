@@ -14,6 +14,7 @@ import (
 	shlex "github.com/anmitsu/go-shlex"
 	"github.com/asaskevich/govalidator"
 	humanize "github.com/dustin/go-humanize"
+	"github.com/jinzhu/gorm"
 	"github.com/mgutz/ansi"
 	"github.com/moby/moby/pkg/namesgenerator"
 	"github.com/moul/ssh"
@@ -40,6 +41,8 @@ const (
 	naMessage = "n/a"
 )
 
+var db *gorm.DB
+
 func shell(s ssh.Session, version, gitSha, gitTag, gitBranch string) error {
 	var (
 		sshCommand = s.Command()
@@ -62,261 +65,16 @@ GLOBAL OPTIONS:
 		Name:   "help, h",
 		Hidden: true,
 	}
-	app := cli.NewApp()
+	app := NewApp(actx)
 	app.Writer = s
 	app.HideVersion = true
-
+	db = actx.db
 	var (
 		myself = &actx.user
-		db     = actx.db
 	)
 
 	app.Commands = []cli.Command{
-		{
-			Name:  "acl",
-			Usage: "Manages ACLs",
-			Subcommands: []cli.Command{
-				{
-					Name:        "create",
-					Usage:       "Creates a new ACL",
-					Description: "$> acl create -",
-					Flags: []cli.Flag{
-						cli.StringSliceFlag{Name: "hostgroup, hg", Usage: "Assigns `HOSTGROUPS` to the acl"},
-						cli.StringSliceFlag{Name: "usergroup, ug", Usage: "Assigns `USERGROUP` to the acl"},
-						cli.StringFlag{Name: "pattern", Usage: "Assigns a host pattern to the acl"},
-						cli.StringFlag{Name: "comment", Usage: "Adds a comment"},
-						cli.StringFlag{Name: "action", Usage: "Assigns the ACL action (allow,deny)", Value: string(dbmodels.ACLActionAllow)},
-						cli.UintFlag{Name: "weight, w", Usage: "Assigns the ACL weight (priority)"},
-					},
-					Action: func(c *cli.Context) error {
-						if err := myself.CheckRoles([]string{"admin"}); err != nil {
-							return err
-						}
-						acl := dbmodels.ACL{
-							Comment:     c.String("comment"),
-							HostPattern: c.String("pattern"),
-							UserGroups:  []*dbmodels.UserGroup{},
-							HostGroups:  []*dbmodels.HostGroup{},
-							Weight:      c.Uint("weight"),
-							Action:      c.String("action"),
-						}
-						if acl.Action != string(dbmodels.ACLActionAllow) && acl.Action != string(dbmodels.ACLActionDeny) {
-							return fmt.Errorf("invalid action %q, allowed values: allow, deny", acl.Action)
-						}
-						if _, err := govalidator.ValidateStruct(acl); err != nil {
-							return err
-						}
-
-						var userGroups []*dbmodels.UserGroup
-						if err := dbmodels.UserGroupsPreload(dbmodels.UserGroupsByIdentifiers(db, c.StringSlice("usergroup"))).Find(&userGroups).Error; err != nil {
-							return err
-						}
-						acl.UserGroups = append(acl.UserGroups, userGroups...)
-						var hostGroups []*dbmodels.HostGroup
-						if err := dbmodels.HostGroupsPreload(dbmodels.HostGroupsByIdentifiers(db, c.StringSlice("hostgroup"))).Find(&hostGroups).Error; err != nil {
-							return err
-						}
-						acl.HostGroups = append(acl.HostGroups, hostGroups...)
-
-						if len(acl.UserGroups) == 0 {
-							return fmt.Errorf("an ACL must have at least one user group")
-						}
-						if len(acl.HostGroups) == 0 && acl.HostPattern == "" {
-							return fmt.Errorf("an ACL must have at least one host group or host pattern")
-						}
-
-						if err := db.Create(&acl).Error; err != nil {
-							return err
-						}
-						fmt.Fprintf(s, "%d\n", acl.ID)
-						return nil
-					},
-				}, {
-					Name:      "inspect",
-					Usage:     "Shows detailed information on one or more ACLs",
-					ArgsUsage: "ACL...",
-					Action: func(c *cli.Context) error {
-						if c.NArg() < 1 {
-							return cli.ShowSubcommandHelp(c)
-						}
-						if err := myself.CheckRoles([]string{"admin"}); err != nil {
-							return err
-						}
-
-						var acls []dbmodels.ACL
-						if err := dbmodels.ACLsPreload(dbmodels.ACLsByIdentifiers(db, c.Args())).Find(&acls).Error; err != nil {
-							return err
-						}
-
-						enc := json.NewEncoder(s)
-						enc.SetIndent("", "  ")
-						return enc.Encode(acls)
-					},
-				}, {
-					Name:  "ls",
-					Usage: "Lists ACLs",
-					Flags: []cli.Flag{
-						cli.BoolFlag{Name: "latest, l", Usage: "Show the latest ACL"},
-						cli.BoolFlag{Name: "quiet, q", Usage: "Only display IDs"},
-					},
-					Action: func(c *cli.Context) error {
-						if err := myself.CheckRoles([]string{"admin"}); err != nil {
-							return err
-						}
-
-						var acls []*dbmodels.ACL
-						query := db.Order("created_at desc").Preload("UserGroups").Preload("HostGroups")
-						if c.Bool("latest") {
-							var acl dbmodels.ACL
-							if err := query.First(&acl).Error; err != nil {
-								return err
-							}
-							acls = append(acls, &acl)
-						} else {
-							if err := query.Find(&acls).Error; err != nil {
-								return err
-							}
-						}
-						if c.Bool("quiet") {
-							for _, acl := range acls {
-								fmt.Fprintln(s, acl.ID)
-							}
-							return nil
-						}
-
-						table := tablewriter.NewWriter(s)
-						table.SetHeader([]string{"ID", "Weight", "User groups", "Host groups", "Host pattern", "Action", "Updated", "Created", "Comment"})
-						table.SetBorder(false)
-						table.SetCaption(true, fmt.Sprintf("Total: %d ACLs.", len(acls)))
-						for _, acl := range acls {
-							userGroups := []string{}
-							hostGroups := []string{}
-							for _, entity := range acl.UserGroups {
-								userGroups = append(userGroups, entity.Name)
-							}
-							for _, entity := range acl.HostGroups {
-								hostGroups = append(hostGroups, entity.Name)
-							}
-
-							table.Append([]string{
-								fmt.Sprintf("%d", acl.ID),
-								fmt.Sprintf("%d", acl.Weight),
-								strings.Join(userGroups, ", "),
-								strings.Join(hostGroups, ", "),
-								acl.HostPattern,
-								acl.Action,
-								humanize.Time(acl.UpdatedAt),
-								humanize.Time(acl.CreatedAt),
-								acl.Comment,
-							})
-						}
-						table.Render()
-						return nil
-					},
-				}, {
-					Name:      "rm",
-					Usage:     "Removes one or more ACLs",
-					ArgsUsage: "ACL...",
-					Action: func(c *cli.Context) error {
-						if c.NArg() < 1 {
-							return cli.ShowSubcommandHelp(c)
-						}
-						if err := myself.CheckRoles([]string{"admin"}); err != nil {
-							return err
-						}
-
-						return dbmodels.ACLsByIdentifiers(db, c.Args()).Delete(&dbmodels.ACL{}).Error
-					},
-				}, {
-					Name:      "update",
-					Usage:     "Updates an existing acl",
-					ArgsUsage: "ACL...",
-					Flags: []cli.Flag{
-						cli.StringFlag{Name: "action, a", Usage: "Update action"},
-						cli.StringFlag{Name: "pattern, p", Usage: "Update host-pattern"},
-						cli.UintFlag{Name: "weight, w", Usage: "Update weight"},
-						cli.StringFlag{Name: "comment, c", Usage: "Update comment"},
-						cli.StringSliceFlag{Name: "assign-usergroup, ug", Usage: "Assign the ACL to new `USERGROUPS`"},
-						cli.StringSliceFlag{Name: "unassign-usergroup", Usage: "Unassign the ACL from `USERGROUPS`"},
-						cli.StringSliceFlag{Name: "assign-hostgroup, hg", Usage: "Assign the ACL to new `HOSTGROUPS`"},
-						cli.StringSliceFlag{Name: "unassign-hostgroup", Usage: "Unassign the ACL from `HOSTGROUPS`"},
-					},
-					Action: func(c *cli.Context) error {
-						if c.NArg() < 1 {
-							return cli.ShowSubcommandHelp(c)
-						}
-						if err := myself.CheckRoles([]string{"admin"}); err != nil {
-							return err
-						}
-
-						var acls []dbmodels.ACL
-						if err := dbmodels.ACLsByIdentifiers(db, c.Args()).Find(&acls).Error; err != nil {
-							return err
-						}
-
-						tx := db.Begin()
-						for _, acl := range acls {
-							model := tx.Model(&acl)
-							update := dbmodels.ACL{
-								Action:      c.String("action"),
-								HostPattern: c.String("pattern"),
-								Weight:      c.Uint("weight"),
-								Comment:     c.String("comment"),
-							}
-							if err := model.Updates(update).Error; err != nil {
-								tx.Rollback()
-								return err
-							}
-
-							// associations
-							var appendUserGroups []dbmodels.UserGroup
-							var deleteUserGroups []dbmodels.UserGroup
-							if err := dbmodels.UserGroupsByIdentifiers(db, c.StringSlice("assign-usergroup")).Find(&appendUserGroups).Error; err != nil {
-								tx.Rollback()
-								return err
-							}
-							if err := dbmodels.UserGroupsByIdentifiers(db, c.StringSlice("unassign-usergroup")).Find(&deleteUserGroups).Error; err != nil {
-								tx.Rollback()
-								return err
-							}
-							if err := model.Association("UserGroups").Append(&appendUserGroups).Error; err != nil {
-								tx.Rollback()
-								return err
-							}
-							if len(deleteUserGroups) > 0 {
-								if err := model.Association("UserGroups").Delete(deleteUserGroups).Error; err != nil {
-									tx.Rollback()
-									return err
-								}
-							}
-
-							var appendHostGroups []dbmodels.HostGroup
-							var deleteHostGroups []dbmodels.HostGroup
-							if err := dbmodels.HostGroupsByIdentifiers(db, c.StringSlice("assign-hostgroup")).Find(&appendHostGroups).Error; err != nil {
-								tx.Rollback()
-								return err
-							}
-							if err := dbmodels.HostGroupsByIdentifiers(db, c.StringSlice("unassign-hostgroup")).Find(&deleteHostGroups).Error; err != nil {
-								tx.Rollback()
-								return err
-							}
-							if err := model.Association("HostGroups").Append(&appendHostGroups).Error; err != nil {
-								tx.Rollback()
-								return err
-							}
-							if len(deleteHostGroups) > 0 {
-								if err := model.Association("HostGroups").Delete(deleteHostGroups).Error; err != nil {
-									tx.Rollback()
-									return err
-								}
-							}
-						}
-
-						return tx.Commit().Error
-					},
-				},
-			},
-		}, {
+		app.AclCommand(), {
 			Name:  "config",
 			Usage: "Manages global configuration",
 			Subcommands: []cli.Command{
